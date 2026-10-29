@@ -3,133 +3,323 @@ import CoreAudio
 import IOKit
 import IOUSBHost
 
-// MARK: - Audient iD control
+// MARK: - Focusrite Clarett control
 //
-// The iD's own control protocol, as reverse engineered by the Linux projects
-// MixiD and BiD (github.com/baakhoff/BiD, docs/PROTOCOL.md): UAC2-style class
-// requests aimed at the spare DFU interface, which no macOS driver claims, so
-// audio keeps playing. The monitor level is entity 0x36 selector 0x12 - the
-// node the front encoder itself moves, so the knob and the keys stay in step.
-// Levels are int16 in 1/256 dB; 0x8000 is silence.
+// The Clarett's own control protocol, from the Linux kernel's scarlett2
+// driver (sound/usb/mixer_scarlett2.c), which documents the "Focusrite
+// Control" interface (bInterfaceClass 255): proprietary packets with a
+// 16-byte header, sent as UAC2-style class requests over the default pipe
+// and addressed to that interface. The values live in the device's data
+// space, addressed by offset. The keys aim at the headphones: their own
+// volume (line outs 2 and 3), or, when the headphones are set to follow
+// the knob in the device's SW/HW switch, the master level - the very value
+// the front knob moves, whose LED ring follows along. The mute is the
+// headphone mute switch, or the front MUTE button in knob mode; a config
+// activation applies each switch write.
+//
+// macOS's AppleUSBAudio claims the audio interfaces, and the Focusrite
+// Control 2 app claims the Control interface while it runs, so the app
+// borrows whichever interface happens to be free for the well under a
+// millisecond it takes. Audio is untouched: control requests go over the
+// default pipe, which no driver can own exclusively.
 
-enum Audient {
-    static let vendorID = 0x2708
-    static let controlInterface: UInt16 = 4
-    static let monitorEntity: UInt16 = 0x36
-    static let volumeSelector: UInt16 = 0x12
-    static let muteSelector: UInt16 = 0x04
-    static let silent = Int16.min
+enum Focusrite {
+    static let vendorID = 0x1235
+    // Clarett 2Pre/4Pre/8Pre USB and Clarett+ 2Pre/4Pre/8Pre share the
+    // protocol and the configuration layout (scarlett2_config_set_clarett)
+    static let productIDs: Set<Int> = [0x8206, 0x8207, 0x8208, 0x820a, 0x820b, 0x820c]
 
-    static let minDB = -96.0
-    static let maxDB = 0.0
-    static let stepDB = 2.0
-    static let fineStepDB = 0.5
-    // presses closer than quickPress seconds apart add stepGrowthDB each;
-    // a held key steps at most once per holdInterval, as if pressed that fast
+    // packet commands
+    static let cmdInit1: UInt32 = 0x00000000
+    static let cmdInit2: UInt32 = 0x00000002
+    static let cmdGetData: UInt32 = 0x00800000
+    static let cmdSetData: UInt32 = 0x00800001
+    static let cmdDataCmd: UInt32 = 0x00800002
+
+    // configuration offsets and activation ids (Clarett config set)
+    static let dimMuteOffset: UInt32 = 0x31      // byte 0 mute, byte 1 dim
+    static let dimMuteActivate: UInt32 = 2
+    static let lineOutVolumeOffset: UInt32 = 0x34 // 2 bytes per channel, dB
+    static let muteSwitchOffset: UInt32 = 0x5c    // 1 byte per channel
+    static let swHwSwitchOffset: UInt32 = 0x66    // 1 byte per channel: 1 follows the knob
+    static let masterVolumeOffset: UInt32 = 0x76  // 2 bytes, dB
+    // line outs 0 and 1 are the monitors, 2 and 3 the headphones
+    static let headphones: UInt32 = 2
+    static let configActivate: UInt32 = 1
+
+    // Sixteen levels, like the system's volume: each press moves one level,
+    // and every level sounds about as much quieter as the one before (equal
+    // perceived steps, the same curve the system speaker volume uses). The
+    // bottom level is the register's true bottom: full digital silence.
+    // Device granularity is 1 dB, which the curve's top honours.
+    static let tickDB: [Int16] = [-127, -40, -30, -24, -20, -17, -14, -12, -10, -8, -7, -5, -4, -3, -2, -1, 0]
+    static let maxTick = tickDB.count - 1
+
+    // presses closer than quickPress seconds apart double the step; a held
+    // key steps at most once per holdInterval, as if pressed that fast
     static let quickPress = 0.35
-    static let holdInterval = 0.15
-    static let stepGrowthDB = 1.0
-    static let maxStepDB = 5.0
+    static let holdInterval = 0.2
 }
 
 struct MonitorState {
     var raw: Int16
     var muted: Bool
+    var followsKnob: Bool
 
-    var db: Double? { raw == Audient.silent ? nil : Double(raw) / 256 }
+    var db: Double { Double(raw) }
+    // the nearest of the sixteen levels
+    var tick: Int {
+        var best = 0, bestDistance = Double.infinity
+        for (i, t) in Focusrite.tickDB.enumerated() {
+            let distance = abs(Double(t) - db)
+            if distance < bestDistance { bestDistance = distance; best = i }
+        }
+        return best
+    }
+    // Audio taper: the bar shows perceived loudness, not dB - each 10 dB
+    // down is half as loud, so the bar falls the way the ear hears, and it
+    // empties as the sound fades to the true bottom.
     var fraction: Double {
-        guard let db, !muted else { return 0 }
-        return min(1, max(0, (db - Audient.minDB) / (Audient.maxDB - Audient.minDB)))
+        guard !muted else { return 0 }
+        let loudness = pow(2, db / 10)
+        let floor = pow(2, Double(Focusrite.tickDB[0]) / 10)
+        return min(1, max(0, (loudness - floor) / (1 - floor)))
     }
 }
 
-final class MonitorControl {
-    // The device reports a write back only 5-20 ms later, so a quick second
-    // press would read the old value: a double mute tap muted twice.
-    private var lastWrite: (state: MonitorState, time: Date)?
+enum USBError: Error { case unreachable, corrupt, rejected }
 
-    private func findService() -> io_service_t {
+final class MonitorControl {
+    // The device answers a while after the request, so a quick second press
+    // would read the old value: a double mute tap muted twice.
+    private var lastWrite: (state: MonitorState, time: Date)?
+    private var seq: UInt16 = 0
+    // The interface the protocol is addressed to (the one with
+    // bInterfaceClass 255), found while claiming.
+    private var controlNumber: UInt8?
+
+    // The interface the protocol is addressed to (the one with
+    // bInterfaceClass 255), found anew every time: the device can come and go.
+    private func findInterfaces() -> [(service: io_service_t, number: UInt8, cls: UInt8)] {
         var iterator: io_iterator_t = 0
-        guard IOServiceGetMatchingServices(kIOMainPortDefault, IOServiceMatching("IOUSBHostInterface"), &iterator) == KERN_SUCCESS else { return 0 }
+        guard IOServiceGetMatchingServices(kIOMainPortDefault, IOServiceMatching("IOUSBHostInterface"), &iterator) == KERN_SUCCESS else { return [] }
         defer { IOObjectRelease(iterator) }
         let parents = IOOptionBits(kIORegistryIterateRecursively | kIORegistryIterateParents)
+        var found: [(service: io_service_t, number: UInt8, cls: UInt8)] = []
         while case let service = IOIteratorNext(iterator), service != 0 {
             let vendor = IORegistryEntrySearchCFProperty(service, kIOServicePlane, "idVendor" as CFString, nil, parents) as? Int
+            let product = IORegistryEntrySearchCFProperty(service, kIOServicePlane, "idProduct" as CFString, nil, parents) as? Int
+            guard vendor == Focusrite.vendorID, let product, Focusrite.productIDs.contains(product) else {
+                IOObjectRelease(service)
+                continue
+            }
             let number = IORegistryEntryCreateCFProperty(service, "bInterfaceNumber" as CFString, nil, 0)?.takeRetainedValue() as? Int
-            if vendor == Audient.vendorID && number == Int(Audient.controlInterface) { return service }
-            IOObjectRelease(service)
+            let cls = IORegistryEntryCreateCFProperty(service, "bInterfaceClass" as CFString, nil, 0)?.takeRetainedValue() as? Int
+            guard let number, let cls else {
+                IOObjectRelease(service)
+                continue
+            }
+            found.append((service, UInt8(number), UInt8(cls)))
         }
-        return 0
+        return found
     }
 
-    // Holds the interface only for one change (well under a millisecond), so
-    // replugging, sleep and the official iD app never find it taken.
-    private func withInterface<T>(_ body: (IOUSBHostInterface) throws -> T) -> T? {
-        let service = findService()
-        guard service != 0 else { return nil }
-        defer { IOObjectRelease(service) }
-        do {
-            let iface = try IOUSBHostInterface(__ioService: service, options: [], queue: nil, interestHandler: nil)
+    // Claims one free interface for the duration of the change. Focusrite
+    // Control 2, while it runs, owns the Control interface, and AppleUSBAudio
+    // owns the audio ones, so the spare interface (4) is tried first, then
+    // the Control interface itself, then the rest.
+    private func withInterface<T>(_ body: (IOUSBHostInterface) throws -> T) throws -> T {
+        let found = findInterfaces()
+        defer { found.forEach { IOObjectRelease($0.service) } }
+        guard let control = found.first(where: { $0.cls == 255 }) else { throw USBError.unreachable }
+        controlNumber = control.number
+        var candidates: [UInt8] = [4, control.number]
+        candidates += found.map { $0.number }.sorted().filter { !candidates.contains($0) }
+
+        for number in candidates {
+            guard let entry = found.first(where: { $0.number == number }) else { continue }
+            let iface: IOUSBHostInterface
+            do {
+                iface = try IOUSBHostInterface(__ioService: entry.service, options: [], queue: nil, interestHandler: nil)
+            } catch {
+                continue  // claimed by someone else: try the next one
+            }
             defer { iface.destroy() }
             return try body(iface)
+        }
+        throw USBError.unreachable
+    }
+
+    // UAC2-style class requests over the default pipe, addressed to the
+    // Focusrite Control interface: bmRequestType 0x21/0xa1, request 2 to
+    // send a packet and 3 to fetch the answer it stages.
+    private func control(_ iface: IOUSBHostInterface, read: Bool, bRequest: UInt8, bytes: [UInt8], timeout: Double) throws -> [UInt8] {
+        guard let control = controlNumber else { throw USBError.unreachable }
+        let request = IOUSBDeviceRequest(bmRequestType: read ? 0xa1 : 0x21, bRequest: bRequest, wValue: 0,
+                                         wIndex: UInt16(control), wLength: UInt16(bytes.count))
+        let data = NSMutableData(bytes: bytes, length: bytes.count)
+        var transferred = 0
+        try iface.__send(request, data: data, bytesTransferred: &transferred, completionTimeout: timeout)
+        return Array(Data(referencing: data).prefix(transferred))
+    }
+
+    private func le16(_ value: UInt16) -> [UInt8] { [UInt8(truncatingIfNeeded: value), UInt8(truncatingIfNeeded: value >> 8)] }
+    private func le32(_ value: UInt32) -> [UInt8] { le16(UInt16(truncatingIfNeeded: value)) + le16(UInt16(truncatingIfNeeded: value >> 16)) }
+    private func readLE16(_ bytes: [UInt8], _ at: Int) -> UInt16 { UInt16(bytes[at]) | UInt16(bytes[at + 1]) << 8 }
+    private func readLE32(_ bytes: [UInt8], _ at: Int) -> UInt32 { UInt32(readLE16(bytes, at)) | UInt32(readLE16(bytes, at + 2)) << 16 }
+
+    private func makePacket(_ cmd: UInt32, seqNo: UInt16, data: [UInt8]) -> [UInt8] {
+        le32(cmd) + le16(UInt16(data.count)) + le16(seqNo) + le32(0) + le32(0) + data
+    }
+
+    // Sends a packet and fetches the staged answer. The device needs a
+    // moment after the request, so each round retries the fetch; a whole
+    // round is repeated because another client (Focusrite Control 2) may
+    // interleave its own request and consume the staged answer. The
+    // sequence and the header must agree (except after init, where the
+    // answer carries 0). A repeated set only writes the same bytes again.
+    private func reqResp(_ iface: IOUSBHostInterface, cmd: UInt32, data: [UInt8], expect: Int) throws -> [UInt8] {
+        let seqNo = seq
+        seq &+= 1
+        let request = makePacket(cmd, seqNo: seqNo, data: data)
+        for round in 0..<3 {
+            var sent = false
+            for _ in 0..<2 where !sent {
+                sent = (try? control(iface, read: false, bRequest: 2, bytes: request, timeout: 0.5))?.count == request.count
+            }
+            guard sent else { throw USBError.unreachable }
+            for _ in 0..<2 {
+                if let resp = try? control(iface, read: true, bRequest: 3, bytes: [UInt8](repeating: 0, count: 16 + expect), timeout: 0.2),
+                   resp.count == 16 + expect,
+                   readLE32(resp, 0) == cmd,
+                   (readLE16(resp, 6) == seqNo || (seqNo == 1 && readLE16(resp, 6) == 0)),
+                   readLE16(resp, 4) == UInt16(expect),
+                   readLE32(resp, 8) == 0,
+                   readLE32(resp, 12) == 0 {
+                    return Array(resp[16...])
+                }
+            }
+            if round < 2 { Thread.sleep(forTimeInterval: 0.02) }
+        }
+        NSLog("ClarettVolume: no answer to command \(String(cmd, radix: 16))")
+        throw USBError.rejected
+    }
+
+    private func getData(_ iface: IOUSBHostInterface, offset: UInt32, size: Int) throws -> [UInt8] {
+        try reqResp(iface, cmd: Focusrite.cmdGetData, data: le32(offset) + le32(UInt32(size)), expect: size)
+    }
+
+    private func setData(_ iface: IOUSBHostInterface, offset: UInt32, bytes: [UInt8]) throws {
+        _ = try reqResp(iface, cmd: Focusrite.cmdSetData, data: le32(offset) + le32(UInt32(bytes.count)) + bytes, expect: 0)
+    }
+
+    private func activate(_ iface: IOUSBHostInterface, id: UInt32) throws {
+        _ = try reqResp(iface, cmd: Focusrite.cmdDataCmd, data: le32(id), expect: 0)
+    }
+
+    // The proprietary boot handshake, as the driver performs it: a drained
+    // banner, then two init packets, their sequences starting over at 1.
+    private func initHandshake(_ iface: IOUSBHostInterface) throws {
+        _ = try? control(iface, read: true, bRequest: 0, bytes: [UInt8](repeating: 0, count: 24), timeout: 0.5)
+        seq = 1
+        _ = try reqResp(iface, cmd: Focusrite.cmdInit1, data: [], expect: 0)
+        seq = 1
+        _ = try reqResp(iface, cmd: Focusrite.cmdInit2, data: [], expect: 84)
+    }
+
+    // The handshake only when the direct way fails: normally the session
+    // Focusrite Control 2 or the boot already opened is still good.
+    private func withSession<T>(_ body: (IOUSBHostInterface) throws -> T) throws -> T {
+        try withInterface { iface in
+            do {
+                return try body(iface)
+            } catch {
+                try initHandshake(iface)
+                return try body(iface)
+            }
+        }
+    }
+
+    // Sets the mute the headphones currently answer to: the front MUTE
+    // button while they follow the knob, their own mute switch otherwise.
+    private func setMute(_ iface: IOUSBHostInterface, _ on: Bool, followsKnob: Bool) throws {
+        if followsKnob {
+            try setData(iface, offset: Focusrite.dimMuteOffset, bytes: [on ? 1 : 0])
+            try activate(iface, id: Focusrite.dimMuteActivate)
+        } else {
+            let base = Focusrite.muteSwitchOffset + Focusrite.headphones
+            try setData(iface, offset: base, bytes: [on ? 1 : 0, on ? 1 : 0])
+            try activate(iface, id: Focusrite.configActivate)
+        }
+    }
+
+    // Reads the level first every time, so a turn of the knob in between is
+    // simply where the next key press starts from. The headphones either
+    // follow the knob (SW/HW switch 1) or carry their own volume.
+    private func readState(_ iface: IOUSBHostInterface) throws -> MonitorState {
+        if let lastWrite, Date().timeIntervalSince(lastWrite.time) < 0.3 { return lastWrite.state }
+        func clamped(_ bytes: [UInt8]) -> Int16 {
+            max(Focusrite.tickDB[0], min(0, Int16(bitPattern: readLE16(bytes, 0))))
+        }
+        let swHw = try getData(iface, offset: Focusrite.swHwSwitchOffset + Focusrite.headphones, size: 1)
+        guard swHw.count == 1 else { throw USBError.corrupt }
+        if swHw[0] != 0 {
+            let level = try getData(iface, offset: Focusrite.masterVolumeOffset, size: 2)
+            let dimMute = try getData(iface, offset: Focusrite.dimMuteOffset, size: 2)
+            guard level.count == 2, dimMute.count == 2 else { throw USBError.corrupt }
+            return MonitorState(raw: clamped(level), muted: dimMute[0] != 0, followsKnob: true)
+        }
+        let base = Focusrite.lineOutVolumeOffset + 2 * Focusrite.headphones
+        let level = try getData(iface, offset: base, size: 4)  // L and R
+        let mute = try getData(iface, offset: Focusrite.muteSwitchOffset + Focusrite.headphones, size: 1)
+        guard level.count == 4, mute.count == 1 else { throw USBError.corrupt }
+        return MonitorState(raw: clamped(level), muted: mute[0] != 0, followsKnob: false)
+    }
+
+    // Moves one or two levels up or down, exactly like the system's volume
+    // keys count through their sixteen steps.
+    func adjust(by ticks: Int) -> MonitorState? {
+        do {
+            return try withSession { iface in
+                var state = try readState(iface)
+                let target = min(Focusrite.maxTick, max(0, state.tick + ticks))
+                let raw = Focusrite.tickDB[target]
+                if raw != state.raw {
+                    if state.followsKnob {
+                        try setData(iface, offset: Focusrite.masterVolumeOffset, bytes: le16(UInt16(bitPattern: raw)))
+                    } else {
+                        let base = Focusrite.lineOutVolumeOffset + 2 * Focusrite.headphones
+                        try setData(iface, offset: base, bytes: le16(UInt16(bitPattern: raw)) + le16(UInt16(bitPattern: raw)))
+                        try activate(iface, id: Focusrite.configActivate)
+                    }
+                    state.raw = raw
+                }
+                // like the system volume: any volume key lifts mute
+                if state.muted {
+                    try setMute(iface, false, followsKnob: state.followsKnob)
+                    state.muted = false
+                }
+                lastWrite = (state, Date())
+                return state
+            }
         } catch {
-            NSLog("iDVolume: USB error: \(error.localizedDescription)")
+            NSLog("ClarettVolume: adjust failed: \(error)")
             return nil
         }
     }
 
-    private func transfer(_ iface: IOUSBHostInterface, read: Bool, selector: UInt16, bytes: [UInt8]) throws -> [UInt8] {
-        let request = IOUSBDeviceRequest(bmRequestType: read ? 0xa1 : 0x21, bRequest: 0x01, wValue: selector << 8,
-                                         wIndex: Audient.monitorEntity << 8 | Audient.controlInterface,
-                                         wLength: UInt16(bytes.count))
-        let data = NSMutableData(bytes: bytes, length: bytes.count)
-        var transferred = 0
-        try iface.__send(request, data: data, bytesTransferred: &transferred, completionTimeout: 0.5)
-        return Array(Data(referencing: data).prefix(transferred))
-    }
-
-    private func readState(_ iface: IOUSBHostInterface) throws -> MonitorState {
-        if let lastWrite, Date().timeIntervalSince(lastWrite.time) < 0.3 { return lastWrite.state }
-        let level = try transfer(iface, read: true, selector: Audient.volumeSelector, bytes: [0, 0])
-        let mute = try transfer(iface, read: true, selector: Audient.muteSelector, bytes: [0])
-        guard level.count == 2, mute.count == 1 else { throw CocoaError(.coderReadCorrupt) }
-        return MonitorState(raw: Int16(bitPattern: UInt16(level[0]) | UInt16(level[1]) << 8), muted: mute[0] != 0)
-    }
-
-    // Reads the level first every time, so a turn of the knob in between is
-    // simply where the next key press starts from.
-    func adjust(by step: Double) -> MonitorState? {
-        withInterface { iface in
-            var state = try readState(iface)
-            let target: Double
-            if let db = state.db {
-                target = db + step
-            } else {
-                target = step > 0 ? Audient.minDB : Audient.minDB - 1
-            }
-            let raw = target < Audient.minDB ? Audient.silent : Int16((min(target, Audient.maxDB) * 256).rounded())
-            if raw != state.raw {
-                let bits = UInt16(bitPattern: raw)
-                _ = try transfer(iface, read: false, selector: Audient.volumeSelector, bytes: [UInt8(bits & 0xff), UInt8(bits >> 8)])
-                state.raw = raw
-            }
-            // like the system volume: any volume key lifts mute
-            if state.muted {
-                _ = try transfer(iface, read: false, selector: Audient.muteSelector, bytes: [0])
-                state.muted = false
-            }
-            lastWrite = (state, Date())
-            return state
-        }
-    }
-
     func toggleMute() -> MonitorState? {
-        withInterface { iface in
-            var state = try readState(iface)
-            state.muted.toggle()
-            _ = try transfer(iface, read: false, selector: Audient.muteSelector, bytes: [state.muted ? 1 : 0])
-            lastWrite = (state, Date())
-            return state
+        do {
+            return try withSession { iface in
+                var state = try readState(iface)
+                state.muted.toggle()
+                try setMute(iface, state.muted, followsKnob: state.followsKnob)
+                lastWrite = (state, Date())
+                return state
+            }
+        } catch {
+            NSLog("ClarettVolume: mute failed: \(error)")
+            return nil
         }
     }
 }
@@ -145,17 +335,17 @@ func stringProperty(_ device: AudioObjectID, _ selector: AudioObjectPropertySele
     return value.takeRetainedValue() as String
 }
 
-// The name of the default output when it is an Audient, nil otherwise; the
+// The name of the default output when it is a Focusrite, nil otherwise; the
 // keys are left to macOS for every other device.
-func audientDefaultOutput() -> String? {
+func focusriteDefaultOutput() -> String? {
     var address = AudioObjectPropertyAddress(mSelector: kAudioHardwarePropertyDefaultOutputDevice,
                                              mScope: kAudioObjectPropertyScopeGlobal,
                                              mElement: kAudioObjectPropertyElementMain)
     var device = AudioObjectID(kAudioObjectUnknown)
     var size = UInt32(MemoryLayout<AudioObjectID>.size)
     guard AudioObjectGetPropertyData(AudioObjectID(kAudioObjectSystemObject), &address, 0, nil, &size, &device) == noErr,
-          stringProperty(device, kAudioObjectPropertyManufacturer) == "Audient" else { return nil }
-    return stringProperty(device, kAudioObjectPropertyName) ?? "Audient"
+          stringProperty(device, kAudioObjectPropertyManufacturer) == "Focusrite" else { return nil }
+    return stringProperty(device, kAudioObjectPropertyName) ?? "Focusrite"
 }
 
 // MARK: - HUD
@@ -226,12 +416,14 @@ final class LevelBar: NSView {
 
     required init?(coder: NSCoder) { fatalError() }
 
-    // Like the system's, the fill ends right over the tick of its level.
+    // Like the system's, the fill ends right over the tick of its level;
+    // at full loudness it covers the bar to the very end.
     func set(_ fraction: Double, animated: Bool) {
         CATransaction.begin()
         CATransaction.setDisableActions(!animated)
         CATransaction.setAnimationDuration(0.15)
-        fill.frame.size.width = fraction > 0 ? inset + (track.frame.width - 2 * inset) * fraction : 0
+        fill.frame.size.width = fraction >= 1 ? bounds.width
+            : fraction > 0 ? inset + (track.frame.width - 2 * inset) * fraction : 0
         CATransaction.commit()
     }
 }
@@ -463,25 +655,24 @@ let soundUpKey = 0, soundDownKey = 1, muteKey = 7
 final class VolumeKeys {
     private let control = MonitorControl()
     private let hud = VolumeHUD()
-    private var lastStep: (key: Int, time: Date, size: Double)?
+    private var lastStep: (key: Int, time: Date, ticks: Int)?
 
-    // Quick presses in one direction grow the step, the way the front knob
-    // speeds up when turned fast, and holding the key counts as pressing it
-    // quickly. The system repeats a held key far more often than anyone can
-    // press, so repeats closer than holdInterval are dropped (nil); that also
-    // spares the iD's control interface a flood of requests.
-    private func step(for key: Int, fine: Bool, isRepeat: Bool) -> Double? {
+    // One level per press, like the system's keys. Quick presses in one
+    // direction move two levels, the way the system speeds up when tapped
+    // fast, and holding the key counts as pressing it quickly. The system
+    // repeats a held key far more often than anyone can press, so repeats
+    // closer than holdInterval are dropped (nil); that also spares the
+    // device's control interface a flood of requests.
+    private func step(for key: Int, fine: Bool, isRepeat: Bool) -> Int? {
         let now = Date()
-        var size = fine ? Audient.fineStepDB : Audient.stepDB
-        if let lastStep, lastStep.key == key {
+        var ticks = 1
+        if !fine, let lastStep, lastStep.key == key {
             let since = now.timeIntervalSince(lastStep.time)
-            if isRepeat && since < Audient.holdInterval { return nil }
-            if !fine && (isRepeat || since < Audient.quickPress) {
-                size = min(lastStep.size + Audient.stepGrowthDB, Audient.maxStepDB)
-            }
+            if isRepeat && since < Focusrite.holdInterval { return nil }
+            if isRepeat || since < Focusrite.quickPress { ticks = 2 }
         }
-        lastStep = (key, now, size)
-        return size
+        lastStep = (key, now, ticks)
+        return ticks
     }
 
     // true when the event is ours and must not reach macOS
@@ -497,15 +688,15 @@ final class VolumeKeys {
         let fine = flags.contains(.maskAlternate) && flags.contains(.maskShift)
         // Option alone keeps its system meaning: it opens Sound settings
         if flags.contains(.maskAlternate) && !fine { return false }
-        guard let device = audientDefaultOutput() else { return false }
+        guard let device = focusriteDefaultOutput() else { return false }
         guard isDown else { return true }
 
         let state: MonitorState?
         switch key {
         case soundUpKey, soundDownKey:
             // a held key between two steps: nothing to change, still ours
-            guard let step = step(for: key, fine: fine, isRepeat: isRepeat) else { return true }
-            state = control.adjust(by: key == soundUpKey ? step : -step)
+            guard let ticks = step(for: key, fine: fine, isRepeat: isRepeat) else { return true }
+            state = control.adjust(by: key == soundUpKey ? ticks : -ticks)
         default: state = control.toggleMute()
         }
         // could not reach the device: let macOS answer as it always did
@@ -541,13 +732,13 @@ func installTap() -> Bool {
 func startWhenTrusted() {
     let prompt = [kAXTrustedCheckOptionPrompt.takeUnretainedValue() as String: true] as CFDictionary
     if AXIsProcessTrustedWithOptions(prompt), installTap() {
-        NSLog("iDVolume: listening for volume keys")
+        NSLog("ClarettVolume: listening for volume keys")
         return
     }
     Timer.scheduledTimer(withTimeInterval: 2, repeats: true) { timer in
         guard AXIsProcessTrusted(), installTap() else { return }
         timer.invalidate()
-        NSLog("iDVolume: listening for volume keys")
+        NSLog("ClarettVolume: listening for volume keys")
     }
 }
 

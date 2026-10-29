@@ -1,20 +1,20 @@
 #!/bin/bash
-# Builds iDVolume, puts it in ~/Applications and starts it at every login.
+# Builds ClarettVolume, puts it in ~/Applications and starts it at every login.
 set -euo pipefail
 cd "$(dirname "$0")"
 
-LABEL=local.idvolume
-DEST="$HOME/Applications/iDVolume.app"
+LABEL=local.clarettvolume
+DEST="$HOME/Applications/ClarettVolume.app"
 AGENT="$HOME/Library/LaunchAgents/$LABEL.plist"
 
 # A rebuild changes the ad-hoc signature, and with it the Accessibility
 # grant, so an existing build is installed as is; run ./build.sh to update.
-[ -d build/iDVolume.app ] || ./build.sh
+[ -d build/ClarettVolume.app ] || ./build.sh
 launchctl bootout "gui/$(id -u)/$LABEL" 2>/dev/null || true
-pkill -x iDVolume 2>/dev/null || true
+pkill -x ClarettVolume 2>/dev/null || true
 mkdir -p "$HOME/Applications" "$HOME/Library/LaunchAgents"
 rm -rf "$DEST"
-cp -R build/iDVolume.app "$DEST"
+cp -R build/ClarettVolume.app "$DEST"
 
 cat > "$AGENT" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>
@@ -22,11 +22,11 @@ cat > "$AGENT" <<PLIST
 <plist version="1.0">
 <dict>
   <key>Label</key><string>$LABEL</string>
-  <key>ProgramArguments</key><array><string>$DEST/Contents/MacOS/iDVolume</string></array>
+  <key>ProgramArguments</key><array><string>$DEST/Contents/MacOS/ClarettVolume</string></array>
   <key>RunAtLoad</key><true/>
   <key>KeepAlive</key><true/>
   <key>ProcessType</key><string>Interactive</string>
-  <key>StandardErrorPath</key><string>$HOME/Library/Logs/iDVolume.log</string>
+  <key>StandardErrorPath</key><string>$HOME/Library/Logs/ClarettVolume.log</string>
 </dict>
 </plist>
 PLIST
